@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::{fs, path::PathBuf};
 use tauri::{AppHandle, Manager, State};
 
 mod asr;
@@ -94,11 +95,15 @@ fn clear_openai_api_key() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_logger();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(hotkey::plugin())
         .setup(|app| {
-            app.manage(AudioController::new(app.handle().clone()));
+            let controller = AudioController::new(app.handle().clone());
+            app.manage(controller.clone());
+            controller.set_hotkey_registration(hotkey::register(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -116,4 +121,37 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        if let Some(path) = panic_log_path() {
+            let location = panic_info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown location".to_string());
+            let _ = fs::write(&path, format!("{panic_info}\nLocation: {location}\n"));
+        }
+
+        default_hook(panic_info);
+    }));
+}
+
+fn panic_log_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("com.tiancrimson.type4me").join("panic.log"))
+        .inspect(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+        })
 }

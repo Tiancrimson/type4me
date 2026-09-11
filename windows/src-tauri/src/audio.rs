@@ -63,6 +63,8 @@ pub struct RecordingState {
     pub last_error: Option<String>,
     pub hotkey_style: HotkeyStyle,
     pub hotkey: String,
+    pub hotkey_registered: bool,
+    pub hotkey_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,6 +87,9 @@ struct RuntimeShared {
     last_injection_outcome: Mutex<Option<InjectionOutcome>>,
     last_error: Mutex<Option<String>>,
     hotkey_style: Mutex<HotkeyStyle>,
+    hotkey: Mutex<String>,
+    hotkey_registered: AtomicBool,
+    hotkey_message: Mutex<Option<String>>,
 }
 
 impl RuntimeShared {
@@ -102,6 +107,9 @@ impl RuntimeShared {
             last_injection_outcome: Mutex::new(None),
             last_error: Mutex::new(None),
             hotkey_style: Mutex::new(HotkeyStyle::Hold),
+            hotkey: Mutex::new(crate::hotkey::DEFAULT_SHORTCUT_LABEL.to_string()),
+            hotkey_registered: AtomicBool::new(false),
+            hotkey_message: Mutex::new(None),
         }
     }
 
@@ -175,7 +183,17 @@ impl RuntimeShared {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
             hotkey_style: self.hotkey_style(),
-            hotkey: crate::hotkey::DEFAULT_SHORTCUT_LABEL.to_string(),
+            hotkey: self
+                .hotkey
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            hotkey_registered: self.hotkey_registered.load(Ordering::Relaxed),
+            hotkey_message: self
+                .hotkey_message
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         }
     }
 
@@ -218,6 +236,22 @@ impl AudioController {
 
     pub fn hotkey_style(&self) -> HotkeyStyle {
         self.shared.hotkey_style()
+    }
+
+    pub fn set_hotkey_registration(&self, registration: crate::hotkey::HotkeyRegistration) {
+        *self
+            .shared
+            .hotkey
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = registration.shortcut;
+        self.shared
+            .hotkey_registered
+            .store(registration.registered, Ordering::Relaxed);
+        *self
+            .shared
+            .hotkey_message
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = registration.message;
     }
 
     pub fn list_devices(&self) -> Result<Vec<AudioDeviceInfo>, String> {
@@ -275,16 +309,14 @@ impl AudioController {
     pub fn start_recording(&self, device_id: Option<String>) -> Result<RecordingState, String> {
         self.ensure_idle("start a recording")?;
 
-        let selected = resolve_input_device(device_id.as_deref()).map_err(|message| {
+        let selected = resolve_input_device(device_id.as_deref()).inspect_err(|message| {
             self.shared.set_error(message.clone());
             self.emit_state();
-            message
         })?;
 
-        let output_path = self.create_recording_path().map_err(|message| {
+        let output_path = self.create_recording_path().inspect_err(|message| {
             self.shared.set_error(message.clone());
             self.emit_state();
-            message
         })?;
 
         *self
@@ -608,9 +640,7 @@ fn append_packet(shared: &RuntimeShared, samples: &mut Vec<i16>, packet: AudioPa
 
 fn list_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
-        .and_then(|device| device.name().ok());
+    let default_device = host.default_input_device();
     let devices = host
         .input_devices()
         .map_err(|error| format!("Failed to enumerate microphones: {error}"))?;
@@ -622,12 +652,21 @@ fn list_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
             .map_err(|error| format!("Failed to read a microphone name: {error}"))?;
         result.push(AudioDeviceInfo {
             id: format!("{index}:{name}"),
-            is_default: default_name.as_deref() == Some(name.as_str()),
+            is_default: default_device
+                .as_ref()
+                .is_some_and(|default| devices_match(&device, default)),
             name,
         });
     }
 
     Ok(result)
+}
+
+fn devices_match(left: &cpal::Device, right: &cpal::Device) -> bool {
+    let (cpal::platform::DeviceInner::Wasapi(left), cpal::platform::DeviceInner::Wasapi(right)) =
+        (left.as_inner(), right.as_inner());
+
+    left == right
 }
 
 fn resolve_input_device(selected_device_id: Option<&str>) -> Result<ResolvedDevice, String> {

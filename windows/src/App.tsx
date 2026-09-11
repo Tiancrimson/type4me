@@ -43,6 +43,8 @@ type RecordingState = {
   lastError: string | null;
   hotkeyStyle: HotkeyStyle;
   hotkey: string;
+  hotkeyRegistered: boolean;
+  hotkeyMessage: string | null;
 };
 
 type AsrSettings = {
@@ -322,6 +324,7 @@ function App() {
           <div className="sidebar-block">
             <span className="sidebar-label">全局快捷键</span>
             <strong>{recording?.hotkey ?? "Ctrl+Shift+Space"}</strong>
+            {recording?.hotkeyRegistered === false && <span>不可用</span>}
           </div>
         </nav>
 
@@ -465,7 +468,15 @@ function App() {
                 <span className="section-label">HOTKEY</span>
                 <h2>全局快捷键</h2>
               </div>
-              <kbd>{recording?.hotkey ?? "Ctrl+Shift+Space"}</kbd>
+              <div className="hotkey-meta">
+                <kbd>{recording?.hotkey ?? "Ctrl+Shift+Space"}</kbd>
+                <span
+                  className="hotkey-state"
+                  data-registered={recording?.hotkeyRegistered === true}
+                >
+                  {recording?.hotkeyRegistered ? "已启用" : "不可用"}
+                </span>
+              </div>
             </div>
 
             <span className="field-label">触发方式</span>
@@ -492,10 +503,14 @@ function App() {
               </button>
             </div>
 
-            <p className="panel-note">
-              {recording?.hotkeyStyle === "hold"
-                ? "按下快捷键开始录音，松开立即停止。"
-                : "每次按下快捷键，在开始和停止之间切换。"}
+            <p
+              className="panel-note"
+              data-warning={recording?.hotkeyRegistered === false}
+            >
+              {recording?.hotkeyMessage ??
+                (recording?.hotkeyStyle === "hold"
+                  ? "按下快捷键开始录音，松开立即停止。"
+                  : "每次按下快捷键，在开始和停止之间切换。")}
             </p>
           </article>
 

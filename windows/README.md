@@ -18,6 +18,11 @@ TypeScript.
 Recording can also be controlled from the desktop UI. The default shortcut
 style is hold-to-talk; toggle mode is available in the shortcut panel.
 
+If another application owns `Ctrl+Shift+Space`, Type4Me tries
+`Ctrl+Alt+Space` and then `Ctrl+Shift+F9`. The active shortcut is shown in the
+UI. If all combinations are unavailable, the application still starts and
+reports the conflict instead of exiting.
+
 ## OpenAI configuration
 
 The Windows build defaults to `gpt-4o-transcribe` and

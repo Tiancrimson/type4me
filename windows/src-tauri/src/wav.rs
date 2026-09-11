@@ -3,7 +3,7 @@ pub const CHANNELS: u16 = 1;
 pub const BITS_PER_SAMPLE: u16 = 16;
 
 pub fn encode_pcm16le(samples: &[i16]) -> Vec<u8> {
-    let data_size = (samples.len() * std::mem::size_of::<i16>()) as u32;
+    let data_size = std::mem::size_of_val(samples) as u32;
     let byte_rate = SAMPLE_RATE * u32::from(CHANNELS) * u32::from(BITS_PER_SAMPLE) / 8;
     let block_align = CHANNELS * BITS_PER_SAMPLE / 8;
 
