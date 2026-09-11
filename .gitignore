@@ -55,9 +55,6 @@ qwen3-asr-server/models/
 *.so
 tools/aec-demo
 
-# Windows (removed, macOS-only project)
-windows/
-
 # Test & Benchmark artifacts
 test-audio/
 test*.txt
