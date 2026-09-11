@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("dev", "build")]
+    [ValidateSet("dev", "build", "test")]
     [string]$Task,
 
     [switch]$DebugBuild,
@@ -39,7 +39,7 @@ if (($env:Path -split ";") -notcontains $cargoBin) {
 
 if ($Task -eq "dev") {
     npm run tauri -- dev
-} else {
+} elseif ($Task -eq "build") {
     $arguments = @("run", "tauri", "--", "build")
     if ($DebugBuild) {
         $arguments += "--debug"
@@ -48,6 +48,18 @@ if ($Task -eq "dev") {
         $arguments += "--no-bundle"
     }
     npm @arguments
+} else {
+    npm run build
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    Push-Location (Join-Path $PSScriptRoot "..\src-tauri")
+    try {
+        cargo test
+    } finally {
+        Pop-Location
+    }
 }
 
 exit $LASTEXITCODE
