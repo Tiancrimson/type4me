@@ -60,6 +60,10 @@ available after the main window is closed. Closing the window hides it; use
 **Quit / 退出** in the tray menu to stop the process completely. Left-clicking
 the tray icon restores the main window.
 
+Type4Me allows only one running instance. Launching it again restores and
+focuses the existing window instead of starting a second process. A repeated
+`--hidden` launch leaves the background instance untouched.
+
 The background panel can enable **Launch at startup / 开机自动启动**. Type4Me
 stores this as a current-user command in:
 
