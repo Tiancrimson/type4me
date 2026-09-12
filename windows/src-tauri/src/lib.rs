@@ -159,6 +159,11 @@ pub fn run() {
     install_panic_logger();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _| {
+            if should_show_second_instance(&arguments) {
+                show_main_window(app);
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(hotkey::plugin())
         .setup(|app| {
@@ -261,6 +266,12 @@ fn should_start_hidden() -> bool {
     std::env::args_os().any(|argument| argument == "--hidden")
 }
 
+fn should_show_second_instance(arguments: &[String]) -> bool {
+    !arguments
+        .iter()
+        .any(|argument| argument.eq_ignore_ascii_case("--hidden"))
+}
+
 fn install_panic_logger() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -292,4 +303,24 @@ fn panic_log_path() -> Option<PathBuf> {
                 let _ = fs::create_dir_all(parent);
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_show_second_instance;
+
+    #[test]
+    fn second_instance_shows_the_existing_window() {
+        assert!(should_show_second_instance(&[
+            r"C:\Program Files\Type4Me\type4me-windows.exe".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn hidden_second_instance_does_not_show_the_existing_window() {
+        assert!(!should_show_second_instance(&[
+            r"C:\Program Files\Type4Me\type4me-windows.exe".to_string(),
+            "--hidden".to_string(),
+        ]));
+    }
 }
