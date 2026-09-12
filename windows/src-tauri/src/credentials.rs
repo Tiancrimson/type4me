@@ -4,7 +4,7 @@ use std::{
 };
 
 use windows::{
-    core::{w, PWSTR},
+    core::{PCWSTR, PWSTR},
     Win32::Security::Credentials::{
         CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
         CRED_TYPE_GENERIC,
@@ -13,11 +13,12 @@ use windows::{
 
 const CREDENTIAL_NOT_FOUND: i32 = 0x8007_0490u32 as i32;
 
-pub fn read_openai_api_key() -> Result<Option<String>, String> {
+pub fn read_api_key(target: &str, user: &str) -> Result<Option<String>, String> {
+    let target = wide(target);
     let mut credential: *mut CREDENTIALW = null_mut();
     let result = unsafe {
         CredReadW(
-            w!("Type4Me/OpenAI"),
+            PCWSTR(target.as_ptr()),
             CRED_TYPE_GENERIC,
             None,
             &mut credential,
@@ -29,7 +30,7 @@ pub fn read_openai_api_key() -> Result<Option<String>, String> {
             return Ok(None);
         }
         return Err(format!(
-            "Failed to read the OpenAI API key from Windows Credential Manager: {error}"
+            "Failed to read the {user} API key from Windows Credential Manager: {error}"
         ));
     }
 
@@ -46,7 +47,7 @@ pub fn read_openai_api_key() -> Result<Option<String>, String> {
             } else {
                 let blob = slice::from_raw_parts(credential_ref.CredentialBlob, blob_size);
                 Some(String::from_utf8(blob.to_vec()).map_err(|error| {
-                    format!("The stored OpenAI API key is not valid UTF-8: {error}")
+                    format!("The stored {user} API key is not valid UTF-8: {error}")
                 }))
             }
         };
@@ -61,20 +62,20 @@ pub fn read_openai_api_key() -> Result<Option<String>, String> {
     }
 }
 
-pub fn write_openai_api_key(api_key: &str) -> Result<(), String> {
+pub fn write_api_key(target: &str, user: &str, api_key: &str) -> Result<(), String> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        return delete_openai_api_key();
+        return delete_api_key(target, user);
     }
 
-    let mut target_name = wide("Type4Me/OpenAI");
-    let mut user_name = wide("OpenAI");
+    let mut target_name = wide(target);
+    let mut user_name = wide(user);
     let mut blob = api_key.as_bytes().to_vec();
     let credential = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
         TargetName: PWSTR(target_name.as_mut_ptr()),
         CredentialBlobSize: u32::try_from(blob.len())
-            .map_err(|_| "The OpenAI API key is too long".to_string())?,
+            .map_err(|_| format!("The {user} API key is too long"))?,
         CredentialBlob: blob.as_mut_ptr(),
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         UserName: PWSTR(user_name.as_mut_ptr()),
@@ -82,14 +83,17 @@ pub fn write_openai_api_key(api_key: &str) -> Result<(), String> {
     };
 
     unsafe { CredWriteW(&credential, 0) }
-        .map_err(|error| format!("Failed to save the OpenAI API key: {error}"))
+        .map_err(|error| format!("Failed to save the {user} API key: {error}"))
 }
 
-pub fn delete_openai_api_key() -> Result<(), String> {
-    match unsafe { CredDeleteW(w!("Type4Me/OpenAI"), CRED_TYPE_GENERIC, None) } {
+pub fn delete_api_key(target: &str, user: &str) -> Result<(), String> {
+    let target = wide(target);
+    match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) } {
         Ok(()) => Ok(()),
         Err(error) if error.code().0 == CREDENTIAL_NOT_FOUND => Ok(()),
-        Err(error) => Err(format!("Failed to delete the OpenAI API key: {error}")),
+        Err(error) => Err(format!(
+            "Failed to delete the {user} API key from Windows Credential Manager: {error}"
+        )),
     }
 }
 

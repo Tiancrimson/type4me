@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
@@ -20,6 +21,13 @@ type AudioDeviceInfo = {
 
 type HotkeyStyle = "hold" | "toggle";
 
+type AsrProvider =
+  | "openai"
+  | "groq"
+  | "siliconflow"
+  | "sensevoice"
+  | "custom";
+
 type RecordingPhase =
   | "idle"
   | "starting"
@@ -38,20 +46,36 @@ type RecordingState = {
   elapsedMs: number;
   level: number;
   lastRecordingPath: string | null;
+  recordingsDirectory: string | null;
   lastTranscript: string | null;
   lastInjectionOutcome: InjectionOutcome | null;
   lastError: string | null;
   hotkeyStyle: HotkeyStyle;
   hotkey: string;
+  hotkeyLabel: string;
   hotkeyRegistered: boolean;
   hotkeyMessage: string | null;
 };
 
 type AsrSettings = {
+  provider: AsrProvider;
   model: string;
   baseUrl: string;
+  settingsSaved: boolean;
   apiKeyConfigured: boolean;
   apiKeyHint: string | null;
+  requiresApiKey: boolean;
+};
+
+type SenseVoiceModelStatus = {
+  installed: boolean;
+  downloadInProgress: boolean;
+  downloadedBytes: number;
+  totalBytes: number;
+  progress: number;
+  modelDirectory: string | null;
+  modelSizeBytes: number;
+  error: string | null;
 };
 
 type AudioLevelEvent = {
@@ -69,13 +93,80 @@ const phaseLabels: Record<RecordingPhase, string> = {
   injecting: "正在输入",
 };
 
+const asrProviderPresets: Record<
+  AsrProvider,
+  {
+    label: string;
+    kind: "cloud" | "local";
+    keyLabel: string;
+    keyUrl?: string;
+    model: string;
+    models: string[];
+    baseUrl: string;
+    keyPlaceholder: string;
+  }
+> = {
+  openai: {
+    label: "OpenAI",
+    kind: "cloud",
+    keyLabel: "OpenAI",
+    keyUrl: "https://platform.openai.com/api-keys",
+    model: "gpt-4o-transcribe",
+    models: ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
+    baseUrl: "https://api.openai.com/v1",
+    keyPlaceholder: "sk-...",
+  },
+  groq: {
+    label: "Groq",
+    kind: "cloud",
+    keyLabel: "Groq",
+    keyUrl: "https://console.groq.com/keys",
+    model: "whisper-large-v3-turbo",
+    models: [
+      "whisper-large-v3-turbo",
+      "whisper-large-v3",
+      "distil-whisper-large-v3-en",
+    ],
+    baseUrl: "https://api.groq.com/openai/v1",
+    keyPlaceholder: "gsk_...",
+  },
+  siliconflow: {
+    label: "SiliconFlow",
+    kind: "cloud",
+    keyLabel: "SiliconFlow",
+    keyUrl: "https://cloud.siliconflow.cn/account/ak",
+    model: "FunAudioLLM/SenseVoiceSmall",
+    models: ["FunAudioLLM/SenseVoiceSmall", "TeleAI/TeleSpeechASR"],
+    baseUrl: "https://api.siliconflow.cn/v1",
+    keyPlaceholder: "sk-...",
+  },
+  sensevoice: {
+    label: "SenseVoice（本地）",
+    kind: "local",
+    keyLabel: "本地模型",
+    model: "sensevoice-small-int8",
+    models: ["sensevoice-small-int8"],
+    baseUrl: "",
+    keyPlaceholder: "",
+  },
+  custom: {
+    label: "自定义 OpenAI 兼容",
+    kind: "cloud",
+    keyLabel: "服务商",
+    model: "gpt-4o-transcribe",
+    models: ["gpt-4o-transcribe", "whisper-1"],
+    baseUrl: "https://api.openai.com/v1",
+    keyPlaceholder: "API Key",
+  },
+};
+
 const phaseHints: Record<RecordingPhase, string> = {
   idle: "选择麦克风后开始录音",
   starting: "正在连接音频设备",
   recording: "松开快捷键后自动识别",
   stopping: "正在完成本次录音",
   cancelling: "正在放弃本次录音",
-  transcribing: "正在请求 OpenAI 语音识别",
+  transcribing: "正在请求语音识别",
   injecting: "正在粘贴识别结果",
 };
 
@@ -100,17 +191,60 @@ function formatDuration(milliseconds: number) {
   )}.${tenths}`;
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 MB";
+  }
+
+  return `${(bytes / 1024 / 1024).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function shortcutFromKeyboardEvent(event: KeyboardEvent) {
+  const modifierKeys = new Set([
+    "AltLeft",
+    "AltRight",
+    "ControlLeft",
+    "ControlRight",
+    "MetaLeft",
+    "MetaRight",
+    "ShiftLeft",
+    "ShiftRight",
+  ]);
+  const modifiers = [
+    event.ctrlKey && "control",
+    event.altKey && "alt",
+    event.shiftKey && "shift",
+    event.metaKey && "super",
+  ].filter((modifier): modifier is string => Boolean(modifier));
+  const key = event.code || event.key;
+
+  if (!modifiers.length) {
+    return {
+      error: "快捷键至少需要包含 Ctrl、Alt、Shift 或 Win 中的一个修饰键。",
+    };
+  }
+  if (!key || modifierKeys.has(key)) {
+    return { shortcut: null, error: null };
+  }
+
+  return { shortcut: [...modifiers, key].join("+"), error: null };
+}
+
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [recording, setRecording] = useState<RecordingState | null>(null);
   const [asrSettings, setAsrSettings] = useState<AsrSettings | null>(null);
+  const [modelStatus, setModelStatus] =
+    useState<SenseVoiceModelStatus | null>(null);
   const [devices, setDevices] = useState<AudioDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [provider, setProvider] = useState<AsrProvider>("openai");
   const [model, setModel] = useState("gpt-4o-transcribe");
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [level, setLevel] = useState(0);
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [isCapturingHotkey, setIsCapturingHotkey] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
 
@@ -124,6 +258,7 @@ function App() {
 
   const applyAsrSettings = useCallback((next: AsrSettings) => {
     setAsrSettings(next);
+    setProvider(next.provider);
     setModel(next.model);
     setBaseUrl(next.baseUrl);
     setApiKey("");
@@ -140,17 +275,25 @@ function App() {
     setCommandError(null);
 
     try {
-      const [status, nextDevices, state, nextAsrSettings] = await Promise.all([
+      const [
+        status,
+        nextDevices,
+        state,
+        nextAsrSettings,
+        nextModelStatus,
+      ] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status"),
         invoke<AudioDeviceInfo[]>("list_audio_devices"),
         invoke<RecordingState>("get_recording_state"),
         invoke<AsrSettings>("get_asr_settings"),
+        invoke<SenseVoiceModelStatus>("get_sensevoice_model_status"),
       ]);
 
       setRuntime(status);
       setDevices(nextDevices);
       applyRecordingState(state);
       applyAsrSettings(nextAsrSettings);
+      setModelStatus(nextModelStatus);
     } catch (error) {
       setCommandError(formatError(error));
     } finally {
@@ -174,6 +317,9 @@ function App() {
         listen<AudioLevelEvent>("audio-level", (event) => {
           setLevel(event.payload.level);
           setElapsedMs(event.payload.elapsedMs);
+        }),
+        listen<SenseVoiceModelStatus>("sensevoice-model-status", (event) => {
+          setModelStatus(event.payload);
         }),
       ]);
 
@@ -200,6 +346,18 @@ function App() {
     () => devices.find((device) => device.id === selectedDeviceId),
     [devices, selectedDeviceId],
   );
+  const providerPreset = asrProviderPresets[provider];
+  const providerSettingsSaved =
+    asrSettings?.settingsSaved === true && asrSettings.provider === provider;
+  const selectedProviderKeyConfigured =
+    providerSettingsSaved && asrSettings?.apiKeyConfigured === true;
+  const selectedProviderReady =
+    providerPreset.kind === "local"
+      ? providerSettingsSaved && modelStatus?.installed === true
+      : selectedProviderKeyConfigured;
+  const senseVoiceInstalled = modelStatus?.installed === true;
+  const senseVoiceDownloading = modelStatus?.downloadInProgress === true;
+  const senseVoiceProgress = Math.round((modelStatus?.progress ?? 0) * 100);
 
   const runRecordingAction = async (
     action: string,
@@ -227,10 +385,53 @@ function App() {
   };
 
   const handleHotkeyStyle = async (style: HotkeyStyle) => {
-    await runRecordingAction("hotkey", () =>
+    await runRecordingAction("hotkey-style", () =>
       invoke<RecordingState>("set_hotkey_style", { style }),
     );
   };
+
+  useEffect(() => {
+    if (!isCapturingHotkey) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setIsCapturingHotkey(false);
+        return;
+      }
+
+      const result = shortcutFromKeyboardEvent(event);
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (result.error) {
+        setCommandError(result.error);
+        setIsCapturingHotkey(false);
+        return;
+      }
+      if (!result.shortcut) {
+        return;
+      }
+
+      setIsCapturingHotkey(false);
+      void runRecordingAction("hotkey-update", () =>
+        invoke<RecordingState>("update_hotkey", {
+          shortcut: result.shortcut,
+        }),
+      );
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [isCapturingHotkey, runRecordingAction]);
+
+  const handleResetHotkey = () =>
+    runRecordingAction("hotkey-reset", () =>
+      invoke<RecordingState>("reset_hotkey"),
+    );
 
   const handleStart = () =>
     runRecordingAction("start", () =>
@@ -276,9 +477,10 @@ function App() {
     try {
       const next = await invoke<AsrSettings>("save_asr_settings", {
         settings: {
+          provider,
           apiKey: apiKey.trim() || null,
-          model,
-          baseUrl,
+          model: model.trim(),
+          baseUrl: baseUrl.trim(),
         },
       });
       applyAsrSettings(next);
@@ -294,9 +496,63 @@ function App() {
     setCommandError(null);
 
     try {
-      await invoke("clear_openai_api_key");
+      await invoke("clear_asr_api_key", { provider });
       applyAsrSettings(await invoke<AsrSettings>("get_asr_settings"));
       setApiKey("");
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleProviderChange = (nextProvider: AsrProvider) => {
+    const preset = asrProviderPresets[nextProvider];
+    const savedSettings =
+      asrSettings?.provider === nextProvider ? asrSettings : null;
+
+    setProvider(nextProvider);
+    setModel(savedSettings?.model ?? preset.model);
+    setBaseUrl(
+      preset.kind === "local" ? "" : (savedSettings?.baseUrl ?? preset.baseUrl),
+    );
+    setApiKey("");
+    setCommandError(null);
+  };
+
+  const handleDownloadSenseVoiceModel = async () => {
+    setPendingAction("sensevoice-download");
+    setCommandError(null);
+
+    try {
+      setModelStatus(
+        await invoke<SenseVoiceModelStatus>("download_sensevoice_model"),
+      );
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleOpenApiKeyPage = async (url?: string) => {
+    if (!url) {
+      return;
+    }
+
+    try {
+      await openUrl(url);
+    } catch (error) {
+      setCommandError(formatError(error));
+    }
+  };
+
+  const handleOpenRecordingsFolder = async () => {
+    setPendingAction("open-recordings");
+    setCommandError(null);
+
+    try {
+      await invoke("open_recordings_folder");
     } catch (error) {
       setCommandError(formatError(error));
     } finally {
@@ -323,7 +579,7 @@ function App() {
           </div>
           <div className="sidebar-block">
             <span className="sidebar-label">全局快捷键</span>
-            <strong>{recording?.hotkey ?? "Ctrl+Shift+Space"}</strong>
+            <strong>{recording?.hotkeyLabel ?? "Ctrl+Shift+Space"}</strong>
             {recording?.hotkeyRegistered === false && <span>不可用</span>}
           </div>
         </nav>
@@ -469,7 +725,7 @@ function App() {
                 <h2>全局快捷键</h2>
               </div>
               <div className="hotkey-meta">
-                <kbd>{recording?.hotkey ?? "Ctrl+Shift+Space"}</kbd>
+                <kbd>{recording?.hotkeyLabel ?? "Ctrl+Shift+Space"}</kbd>
                 <span
                   className="hotkey-state"
                   data-registered={recording?.hotkeyRegistered === true}
@@ -503,77 +759,218 @@ function App() {
               </button>
             </div>
 
+            <div className="hotkey-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                aria-pressed={isCapturingHotkey}
+                onClick={() =>
+                  setIsCapturingHotkey((currentState) => !currentState)
+                }
+                disabled={!isIdle || isBusy}
+              >
+                {pendingAction === "hotkey-update"
+                  ? "正在更新"
+                  : isCapturingHotkey
+                    ? "请按下新组合"
+                    : "录制新快捷键"}
+              </button>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void handleResetHotkey()}
+                disabled={!isIdle || isBusy}
+              >
+                {pendingAction === "hotkey-reset" ? "恢复中" : "恢复默认"}
+              </button>
+            </div>
+
             <p
               className="panel-note"
               data-warning={recording?.hotkeyRegistered === false}
             >
-              {recording?.hotkeyMessage ??
-                (recording?.hotkeyStyle === "hold"
-                  ? "按下快捷键开始录音，松开立即停止。"
-                  : "每次按下快捷键，在开始和停止之间切换。")}
+              {isCapturingHotkey
+                ? "请按下包含 Ctrl、Alt、Shift 或 Win 的组合键，按 Esc 取消。"
+                : (recording?.hotkeyMessage ??
+                  (recording?.hotkeyStyle === "hold"
+                    ? "按下快捷键开始录音，松开立即停止。"
+                    : "每次按下快捷键，在开始和停止之间切换。"))}
             </p>
           </article>
 
           <article className="control-panel settings-panel">
             <div className="panel-heading">
               <div>
-                <span className="section-label">OPENAI</span>
+                <span className="section-label">ASR</span>
                 <h2>语音识别</h2>
               </div>
               <span
                 className="settings-state"
-                data-configured={asrSettings?.apiKeyConfigured === true}
+                data-configured={selectedProviderReady}
               >
                 <span />
-                {asrSettings?.apiKeyConfigured ? "Key 已配置" : "需要 API Key"}
+                {providerPreset.kind === "local"
+                  ? !providerSettingsSaved
+                    ? "尚未保存"
+                    : senseVoiceInstalled
+                      ? "本地模型已就绪"
+                      : senseVoiceDownloading
+                        ? "正在下载模型"
+                        : "需要下载模型"
+                  : selectedProviderKeyConfigured
+                    ? "API Key 已配置"
+                    : providerSettingsSaved
+                      ? "需要 API Key"
+                      : "尚未保存"}
               </span>
             </div>
 
             <div className="settings-form">
               <label className="field">
-                <span className="field-label">识别模型</span>
+                <span className="field-label">服务商</span>
                 <select
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
+                  value={provider}
+                  onChange={(event) =>
+                    handleProviderChange(event.target.value as AsrProvider)
+                  }
                   disabled={!isIdle || isBusy}
                 >
-                  <option value="gpt-4o-transcribe">
-                    gpt-4o-transcribe（推荐）
-                  </option>
-                  <option value="gpt-4o-mini-transcribe">
-                    gpt-4o-mini-transcribe
-                  </option>
-                  <option value="whisper-1">whisper-1</option>
+                  {Object.entries(asrProviderPresets).map(
+                    ([providerId, preset]) => (
+                      <option key={providerId} value={providerId}>
+                        {preset.label}
+                      </option>
+                    ),
+                  )}
                 </select>
               </label>
 
-              <label className="field">
-                <span className="field-label">API 地址</span>
-                <input
-                  type="url"
-                  value={baseUrl}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  spellCheck={false}
-                  disabled={!isIdle || isBusy}
-                />
-              </label>
+              {providerPreset.kind === "local" ? (
+                <div className="local-model-summary">
+                  <div className="local-model-heading">
+                    <div>
+                      <strong>SenseVoice Small</strong>
+                      <span>中、英、粤、日、韩，本地离线识别</span>
+                    </div>
+                    <span
+                      className="local-model-badge"
+                      data-ready={senseVoiceInstalled}
+                    >
+                      {senseVoiceInstalled
+                        ? "已就绪"
+                        : senseVoiceDownloading
+                          ? `${senseVoiceProgress}%`
+                          : "未下载"}
+                    </span>
+                  </div>
 
-              <label className="field">
-                <span className="field-label">OpenAI API Key</span>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                  placeholder={
-                    asrSettings?.apiKeyConfigured
-                      ? (asrSettings.apiKeyHint ?? "已保存")
-                      : "sk-..."
-                  }
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={!isIdle || isBusy}
-                />
-              </label>
+                  <div
+                    className="model-progress"
+                    data-active={senseVoiceDownloading}
+                  >
+                    <span
+                      style={{
+                        width: `${senseVoiceDownloading ? senseVoiceProgress : senseVoiceInstalled ? 100 : 0}%`,
+                      }}
+                    />
+                  </div>
+                  <div className="model-meta">
+                    <span>
+                      {senseVoiceInstalled
+                        ? `模型大小 ${formatBytes(modelStatus?.modelSizeBytes ?? 0)}`
+                        : `下载大小 ${formatBytes(modelStatus?.totalBytes ?? 0)}`}
+                    </span>
+                    <span>
+                      {senseVoiceDownloading
+                        ? `${formatBytes(modelStatus?.downloadedBytes ?? 0)} / ${formatBytes(modelStatus?.totalBytes ?? 0)}`
+                        : "首次使用时下载"}
+                    </span>
+                  </div>
+
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => void handleDownloadSenseVoiceModel()}
+                    disabled={
+                      !isIdle ||
+                      isBusy ||
+                      senseVoiceInstalled ||
+                      senseVoiceDownloading
+                    }
+                  >
+                    {senseVoiceDownloading
+                      ? "正在下载"
+                      : senseVoiceInstalled
+                        ? "模型已就绪"
+                        : "下载本地模型"}
+                  </button>
+
+                  {modelStatus?.error && (
+                    <p className="inline-error">{modelStatus.error}</p>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <label className="field">
+                    <span className="field-label">识别模型</span>
+                    <input
+                      list="asr-model-options"
+                      value={model}
+                      onChange={(event) => setModel(event.target.value)}
+                      spellCheck={false}
+                      disabled={!isIdle || isBusy}
+                    />
+                    <datalist id="asr-model-options">
+                      {providerPreset.models.map((modelId) => (
+                        <option key={modelId} value={modelId} />
+                      ))}
+                    </datalist>
+                  </label>
+
+                  <label className="field">
+                    <span className="field-label">
+                      API 地址（OpenAI 兼容 Base URL）
+                    </span>
+                    <input
+                      type="url"
+                      value={baseUrl}
+                      onChange={(event) => setBaseUrl(event.target.value)}
+                      spellCheck={false}
+                      disabled={!isIdle || isBusy}
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span className="field-label-row">
+                      <span>{providerPreset.keyLabel} API Key</span>
+                      {providerPreset.keyUrl && (
+                        <button
+                          className="link-button"
+                          type="button"
+                          onClick={() =>
+                            void handleOpenApiKeyPage(providerPreset.keyUrl)
+                          }
+                        >
+                          获取 API Key
+                        </button>
+                      )}
+                    </span>
+                    <input
+                      type="password"
+                      value={apiKey}
+                      onChange={(event) => setApiKey(event.target.value)}
+                      placeholder={
+                        selectedProviderKeyConfigured
+                          ? (asrSettings?.apiKeyHint ?? "已保存")
+                          : providerPreset.keyPlaceholder
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={!isIdle || isBusy}
+                    />
+                  </label>
+                </>
+              )}
 
               <div className="settings-actions">
                 <button
@@ -584,22 +981,25 @@ function App() {
                 >
                   {pendingAction === "asr-save" ? "保存中" : "保存设置"}
                 </button>
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={() => void handleClearApiKey()}
-                  disabled={
-                    !isIdle || isBusy || !asrSettings?.apiKeyConfigured
-                  }
-                >
-                  {pendingAction === "asr-clear" ? "清除中" : "清除 Key"}
-                </button>
+                {providerPreset.kind === "cloud" && (
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => void handleClearApiKey()}
+                    disabled={
+                      !isIdle || isBusy || !selectedProviderKeyConfigured
+                    }
+                  >
+                    {pendingAction === "asr-clear" ? "清除中" : "清除 Key"}
+                  </button>
+                )}
               </div>
             </div>
 
             <p className="panel-note">
-              API Key 仅保存在 Windows 凭据管理器。未配置时仍会保存 WAV
-              文件。
+              {providerPreset.kind === "local"
+                ? "模型文件保存在本机，录音无需上传到云端。首次识别前需要下载约 156 MB 的量化模型。"
+                : "云服务通过 OpenAI 兼容的音频转写接口调用。API Key 分别保存在 Windows 凭据管理器中；未配置时仍会保存 WAV 文件。"}
             </p>
           </article>
 
@@ -629,18 +1029,36 @@ function App() {
               </section>
 
               <section className="result-section">
-                <span className="field-label">录音文件</span>
-                {recording?.lastRecordingPath ? (
-                  <div
-                    className="output-path"
-                    title={recording.lastRecordingPath}
+                <div className="result-heading">
+                  <span className="field-label">录音文件</span>
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => void handleOpenRecordingsFolder()}
+                    disabled={isBusy}
                   >
-                    <span className="output-icon" />
-                    <span>{recording.lastRecordingPath}</span>
-                  </div>
-                ) : (
-                  <p className="result-empty">尚未生成录音文件</p>
-                )}
+                    {pendingAction === "open-recordings"
+                      ? "正在打开"
+                      : "打开录音文件夹"}
+                  </button>
+                </div>
+                <div
+                  className="output-path"
+                  title={recording?.recordingsDirectory ?? undefined}
+                >
+                  <span className="output-icon" />
+                  <span>
+                    {recording?.recordingsDirectory ?? "正在解析录音目录"}
+                  </span>
+                </div>
+                <p
+                  className="last-recording-path"
+                  title={recording?.lastRecordingPath ?? undefined}
+                >
+                  {recording?.lastRecordingPath
+                    ? `最近文件：${recording.lastRecordingPath}`
+                    : "本次尚未生成录音文件"}
+                </p>
               </section>
             </div>
           </article>

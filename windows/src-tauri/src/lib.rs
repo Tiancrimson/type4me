@@ -9,7 +9,9 @@ mod hotkey;
 mod injection;
 mod wav;
 
-use asr::{AsrSettings, AsrSettingsInput};
+use asr::{
+    AsrProvider, AsrSettings, AsrSettingsInput, SenseVoiceModelManager, SenseVoiceModelStatus,
+};
 use audio::{AudioController, AudioDeviceInfo, HotkeyStyle, RecordingState};
 
 #[derive(Serialize)]
@@ -56,8 +58,34 @@ fn select_audio_device(
 }
 
 #[tauri::command]
-fn set_hotkey_style(controller: State<'_, AudioController>, style: HotkeyStyle) -> RecordingState {
+fn set_hotkey_style(
+    controller: State<'_, AudioController>,
+    style: HotkeyStyle,
+) -> Result<RecordingState, String> {
     controller.set_hotkey_style(style)
+}
+
+#[tauri::command]
+fn update_hotkey(
+    app: AppHandle,
+    controller: State<'_, AudioController>,
+    shortcut: String,
+) -> Result<RecordingState, String> {
+    let state = controller.snapshot();
+    let registration = hotkey::update(&app, &state.hotkey, state.hotkey_registered, &shortcut)?;
+    controller.set_hotkey_registration(registration);
+    Ok(controller.snapshot())
+}
+
+#[tauri::command]
+fn reset_hotkey(
+    app: AppHandle,
+    controller: State<'_, AudioController>,
+) -> Result<RecordingState, String> {
+    let state = controller.snapshot();
+    let registration = hotkey::reset(&app, &state.hotkey, state.hotkey_registered)?;
+    controller.set_hotkey_registration(registration);
+    Ok(controller.snapshot())
 }
 
 #[tauri::command]
@@ -79,6 +107,11 @@ fn cancel_recording(controller: State<'_, AudioController>) -> Result<RecordingS
 }
 
 #[tauri::command]
+fn open_recordings_folder(controller: State<'_, AudioController>) -> Result<(), String> {
+    controller.open_recordings_folder()
+}
+
+#[tauri::command]
 fn get_asr_settings(app: AppHandle) -> Result<AsrSettings, String> {
     asr::load_settings(&app)
 }
@@ -89,8 +122,20 @@ fn save_asr_settings(app: AppHandle, settings: AsrSettingsInput) -> Result<AsrSe
 }
 
 #[tauri::command]
-fn clear_openai_api_key() -> Result<(), String> {
-    asr::clear_api_key()
+fn clear_asr_api_key(provider: AsrProvider) -> Result<(), String> {
+    asr::clear_api_key(provider)
+}
+
+#[tauri::command]
+fn get_sensevoice_model_status(models: State<'_, SenseVoiceModelManager>) -> SenseVoiceModelStatus {
+    models.status()
+}
+
+#[tauri::command]
+fn download_sensevoice_model(
+    models: State<'_, SenseVoiceModelManager>,
+) -> Result<SenseVoiceModelStatus, String> {
+    models.download()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -101,7 +146,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(hotkey::plugin())
         .setup(|app| {
-            let controller = AudioController::new(app.handle().clone());
+            let model_manager = SenseVoiceModelManager::new(app.handle().clone());
+            app.manage(model_manager.clone());
+            let controller = AudioController::new(app.handle().clone(), model_manager);
             app.manage(controller.clone());
             controller.set_hotkey_registration(hotkey::register(app.handle()));
             Ok(())
@@ -112,12 +159,17 @@ pub fn run() {
             list_audio_devices,
             select_audio_device,
             set_hotkey_style,
+            update_hotkey,
+            reset_hotkey,
             start_recording,
             stop_recording,
             cancel_recording,
+            open_recordings_folder,
             get_asr_settings,
             save_asr_settings,
-            clear_openai_api_key,
+            clear_asr_api_key,
+            get_sensevoice_model_status,
+            download_sensevoice_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

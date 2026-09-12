@@ -328,6 +328,7 @@ h2 {
 .cancel-button,
 .text-button,
 .primary-button,
+.secondary-button,
 .segmented-control button {
   border: 0;
   cursor: pointer;
@@ -404,6 +405,7 @@ h2 {
 .cancel-button:disabled,
 .text-button:disabled,
 .primary-button:disabled,
+.secondary-button:disabled,
 .segmented-control button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
@@ -414,6 +416,7 @@ h2 {
 .cancel-button:focus-visible,
 .text-button:focus-visible,
 .primary-button:focus-visible,
+.secondary-button:focus-visible,
 .segmented-control button:focus-visible,
 select:focus-visible,
 input:focus-visible {
@@ -496,6 +499,36 @@ kbd {
   color: #6e7b78;
   font-size: 12px;
   font-weight: 650;
+}
+
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #6e7b78;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #b64d31;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.link-button:hover:not(:disabled) {
+  color: #8f3822;
+  text-decoration: underline;
+}
+
+.link-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 select {
@@ -590,6 +623,32 @@ input:disabled {
   box-shadow: 0 1px 3px rgba(23, 33, 38, 0.12);
 }
 
+.hotkey-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.secondary-button {
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid #cbd2d0;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #26322f;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.secondary-button:hover:not(:disabled),
+.secondary-button[aria-pressed="true"] {
+  border-color: #d39788;
+  background: #fff7f4;
+  color: #a6442c;
+}
+
 .panel-note {
   margin: auto 0 0;
   padding-top: 20px;
@@ -646,6 +705,96 @@ input:disabled {
   gap: 14px;
 }
 
+.local-model-summary {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #d9e0de;
+  border-radius: 8px;
+  background: #f8faf9;
+}
+
+.local-model-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.local-model-heading div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.local-model-heading strong {
+  font-size: 14px;
+  font-weight: 690;
+}
+
+.local-model-heading span {
+  color: #74807d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.local-model-badge {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 4px 8px;
+  border: 1px solid #d3dad8;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #7a8784;
+  font-size: 11px;
+  font-weight: 680;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.local-model-badge[data-ready="true"] {
+  border-color: #b8dfce;
+  background: #f2fbf7;
+  color: #286d50;
+}
+
+.model-progress {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e4e9e7;
+}
+
+.model-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #49a97d;
+  transition: width 180ms ease;
+}
+
+.model-progress[data-active="false"] > span {
+  background: #aeb9b6;
+}
+
+.model-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 12px;
+  color: #7a8784;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.inline-error {
+  margin: 0;
+  color: #a6442c;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .field {
   display: grid;
   min-width: 0;
@@ -695,6 +844,17 @@ input:disabled {
   border-top: 1px solid #e3e8e6;
 }
 
+.result-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.result-heading .field-label {
+  margin-bottom: 0;
+}
+
 .transcript-text {
   max-height: 138px;
   margin: 0;
@@ -737,6 +897,16 @@ input:disabled {
   border: 1px solid #78918a;
   border-radius: 2px;
   background: #ffffff;
+}
+
+.last-recording-path {
+  margin: 0;
+  overflow: hidden;
+  color: #7a8784;
+  font-size: 11px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-output {
@@ -846,6 +1016,8 @@ input:disabled {
   .stop-button,
   .cancel-button,
   .text-button,
+  .link-button,
+  .secondary-button,
   .segmented-control button,
   .level-track > span {
     transition:
