@@ -12,9 +12,10 @@ use std::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::{
-    asr,
+    asr::{self, SenseVoiceModelManager},
     injection::{self, InjectionOutcome},
     wav,
 };
@@ -58,11 +59,13 @@ pub struct RecordingState {
     pub elapsed_ms: u64,
     pub level: f32,
     pub last_recording_path: Option<String>,
+    pub recordings_directory: Option<String>,
     pub last_transcript: Option<String>,
     pub last_injection_outcome: Option<InjectionOutcome>,
     pub last_error: Option<String>,
     pub hotkey_style: HotkeyStyle,
     pub hotkey: String,
+    pub hotkey_label: String,
     pub hotkey_registered: bool,
     pub hotkey_message: Option<String>,
 }
@@ -83,17 +86,19 @@ struct RuntimeShared {
     stop_requested: AtomicBool,
     cancel_requested: AtomicBool,
     last_recording_path: Mutex<Option<String>>,
+    recordings_directory: Mutex<Option<String>>,
     last_transcript: Mutex<Option<String>>,
     last_injection_outcome: Mutex<Option<InjectionOutcome>>,
     last_error: Mutex<Option<String>>,
     hotkey_style: Mutex<HotkeyStyle>,
     hotkey: Mutex<String>,
+    hotkey_label: Mutex<String>,
     hotkey_registered: AtomicBool,
     hotkey_message: Mutex<Option<String>>,
 }
 
 impl RuntimeShared {
-    fn new() -> Self {
+    fn new(hotkey_style: HotkeyStyle, recordings_directory: Option<String>) -> Self {
         Self {
             phase: Mutex::new(RecordingPhase::Idle),
             selected_device_id: Mutex::new(None),
@@ -103,11 +108,13 @@ impl RuntimeShared {
             stop_requested: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             last_recording_path: Mutex::new(None),
+            recordings_directory: Mutex::new(recordings_directory),
             last_transcript: Mutex::new(None),
             last_injection_outcome: Mutex::new(None),
             last_error: Mutex::new(None),
-            hotkey_style: Mutex::new(HotkeyStyle::Hold),
-            hotkey: Mutex::new(crate::hotkey::DEFAULT_SHORTCUT_LABEL.to_string()),
+            hotkey_style: Mutex::new(hotkey_style),
+            hotkey: Mutex::new(crate::hotkey::DEFAULT_SHORTCUT.to_string()),
+            hotkey_label: Mutex::new(crate::hotkey::DEFAULT_SHORTCUT_LABEL.to_string()),
             hotkey_registered: AtomicBool::new(false),
             hotkey_message: Mutex::new(None),
         }
@@ -168,6 +175,11 @@ impl RuntimeShared {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            recordings_directory: self
+                .recordings_directory
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             last_transcript: self
                 .last_transcript
                 .lock()
@@ -185,6 +197,11 @@ impl RuntimeShared {
             hotkey_style: self.hotkey_style(),
             hotkey: self
                 .hotkey
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            hotkey_label: self
+                .hotkey_label
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
@@ -216,13 +233,26 @@ impl RuntimeShared {
 pub struct AudioController {
     app: AppHandle,
     shared: Arc<RuntimeShared>,
+    sense_voice_models: SenseVoiceModelManager,
 }
 
 impl AudioController {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(app: AppHandle, sense_voice_models: SenseVoiceModelManager) -> Self {
+        let recordings_directory = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|directory| directory.join("recordings"))
+            .map(|directory| {
+                let _ = fs::create_dir_all(&directory);
+                directory.to_string_lossy().into_owned()
+            });
+        let hotkey_style = crate::hotkey::load_style(&app).unwrap_or(HotkeyStyle::Hold);
+
         Self {
             app,
-            shared: Arc::new(RuntimeShared::new()),
+            shared: Arc::new(RuntimeShared::new(hotkey_style, recordings_directory)),
+            sense_voice_models,
         }
     }
 
@@ -244,6 +274,11 @@ impl AudioController {
             .hotkey
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = registration.shortcut;
+        *self
+            .shared
+            .hotkey_label
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = registration.label;
         self.shared
             .hotkey_registered
             .store(registration.registered, Ordering::Relaxed);
@@ -252,6 +287,7 @@ impl AudioController {
             .hotkey_message
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = registration.message;
+        self.emit_state();
     }
 
     pub fn list_devices(&self) -> Result<Vec<AudioDeviceInfo>, String> {
@@ -296,14 +332,26 @@ impl AudioController {
         Ok(self.snapshot())
     }
 
-    pub fn set_hotkey_style(&self, style: HotkeyStyle) -> RecordingState {
+    pub fn set_hotkey_style(&self, style: HotkeyStyle) -> Result<RecordingState, String> {
+        crate::hotkey::save_style(&self.app, style)?;
         *self
             .shared
             .hotkey_style
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = style;
         self.emit_state();
-        self.snapshot()
+        Ok(self.snapshot())
+    }
+
+    pub fn open_recordings_folder(&self) -> Result<(), String> {
+        let recordings_directory = self.recordings_directory()?;
+        self.app
+            .opener()
+            .open_path(
+                recordings_directory.to_string_lossy().into_owned(),
+                None::<&str>,
+            )
+            .map_err(|error| format!("Failed to open the recordings folder: {error}"))
     }
 
     pub fn start_recording(&self, device_id: Option<String>) -> Result<RecordingState, String> {
@@ -417,6 +465,16 @@ impl AudioController {
     }
 
     fn create_recording_path(&self) -> Result<PathBuf, String> {
+        let recordings_dir = self.recordings_directory()?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("The system clock is unavailable: {error}"))?
+            .as_millis();
+        Ok(recordings_dir.join(format!("recording-{timestamp}.wav")))
+    }
+
+    fn recordings_directory(&self) -> Result<PathBuf, String> {
         let app_data_dir = self.app.path().app_data_dir().map_err(|error| {
             format!("Failed to resolve the application data directory: {error}")
         })?;
@@ -427,12 +485,7 @@ impl AudioController {
                 recordings_dir.display()
             )
         })?;
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("The system clock is unavailable: {error}"))?
-            .as_millis();
-        Ok(recordings_dir.join(format!("recording-{timestamp}.wav")))
+        Ok(recordings_dir)
     }
 
     fn complete_recording_session(&self, output_path: PathBuf, selected_device_id: Option<String>) {
@@ -479,9 +532,14 @@ impl AudioController {
     }
 
     fn transcribe_and_inject(&self, path: &std::path::Path) {
-        let config = match asr::load_openai_config(&self.app) {
+        let config = match asr::load_config(&self.app) {
             Ok(Some(config)) => config,
-            Ok(None) => return,
+            Ok(None) => {
+                self.shared.set_error(
+                    "尚未保存语音识别设置，或当前服务商缺少 API Key。请先在“语音识别”中保存设置。",
+                );
+                return;
+            }
             Err(error) => {
                 self.shared.set_error(error);
                 return;
@@ -490,7 +548,7 @@ impl AudioController {
 
         self.shared.set_phase(RecordingPhase::Transcribing);
         self.emit_state();
-        let transcript = match asr::transcribe_wav(path, &config) {
+        let transcript = match asr::transcribe_wav(&self.sense_voice_models, path, &config) {
             Ok(transcript) => transcript,
             Err(error) => {
                 self.shared.set_error(error);
@@ -499,6 +557,8 @@ impl AudioController {
         };
 
         if transcript.is_empty() {
+            self.shared
+                .set_error("未识别到有效语音，录音文件已保存，可以重试。");
             return;
         }
 

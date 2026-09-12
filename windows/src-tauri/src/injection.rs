@@ -13,16 +13,17 @@ use windows::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-            VK_CONTROL, VK_V,
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+            KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_V,
         },
         WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
     },
 };
 
-const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(20);
-const CLIPBOARD_RETRY_COUNT: usize = 5;
+const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(25);
+const CLIPBOARD_RETRY_COUNT: usize = 12;
 const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(300);
+const UNICODE_INPUT_CHUNK_SIZE: usize = 256;
 const UNICODE_TEXT_FORMAT: u32 = CF_UNICODETEXT.0 as u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -38,14 +39,21 @@ pub fn inject_text(text: &str) -> Result<InjectionOutcome, String> {
         return Ok(InjectionOutcome::Inserted);
     }
 
-    let original = ClipboardSnapshot::capture().ok();
-
     if !has_external_foreground_window() {
         write_clipboard_text(Some(text))?;
         return Ok(InjectionOutcome::CopiedToClipboard);
     }
 
-    write_clipboard_text(Some(text))?;
+    let original = ClipboardSnapshot::capture().ok();
+    if let Err(clipboard_error) = write_clipboard_text(Some(text)) {
+        return send_unicode_text(text).map_err(|unicode_error| {
+            format!(
+                "Failed to inject text. Clipboard access failed: {clipboard_error}. \
+                 Direct Unicode input also failed: {unicode_error}"
+            )
+        });
+    }
+
     let pasted_sequence_number = unsafe { GetClipboardSequenceNumber() };
     if simulate_paste().is_err() {
         return Ok(InjectionOutcome::CopiedToClipboard);
@@ -54,6 +62,29 @@ pub fn inject_text(text: &str) -> Result<InjectionOutcome, String> {
     thread::sleep(PASTE_SETTLE_DELAY);
     if let Some(original) = original {
         let _ = original.restore(pasted_sequence_number);
+    }
+
+    Ok(InjectionOutcome::Inserted)
+}
+
+fn send_unicode_text(text: &str) -> Result<InjectionOutcome, String> {
+    let code_units = text.encode_utf16().collect::<Vec<_>>();
+
+    for chunk in code_units.chunks(UNICODE_INPUT_CHUNK_SIZE) {
+        let mut inputs = Vec::with_capacity(chunk.len() * 2);
+        for unit in chunk {
+            inputs.push(unicode_input(*unit, false));
+            inputs.push(unicode_input(*unit, true));
+        }
+
+        let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            let error = std::io::Error::last_os_error();
+            return Err(format!(
+                "Windows accepted {sent} of {} Unicode input events: {error}",
+                inputs.len()
+            ));
+        }
     }
 
     Ok(InjectionOutcome::Inserted)
@@ -231,6 +262,24 @@ fn keyboard_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
                     KEYEVENTF_KEYUP
                 } else {
                     Default::default()
+                },
+                ..Default::default()
+            },
+        },
+    }
+}
+
+fn unicode_input(code_unit: u16, key_up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: code_unit,
+                dwFlags: if key_up {
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                } else {
+                    KEYEVENTF_UNICODE
                 },
                 ..Default::default()
             },
