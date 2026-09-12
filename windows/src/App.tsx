@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 type RuntimeStatus = {
@@ -11,45 +12,297 @@ type RuntimeStatus = {
   backendConnected: boolean;
 };
 
-type RequestState =
-  | { kind: "loading" }
-  | { kind: "ready"; status: RuntimeStatus }
-  | { kind: "error"; message: string };
-
-const platformLabels: Record<string, string> = {
-  windows: "Windows",
-  macos: "macOS",
-  linux: "Linux",
+type AudioDeviceInfo = {
+  id: string;
+  name: string;
+  isDefault: boolean;
 };
 
-const architectureLabels: Record<string, string> = {
-  x86_64: "x64",
-  aarch64: "ARM64",
+type HotkeyStyle = "hold" | "toggle";
+
+type RecordingPhase =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "stopping"
+  | "cancelling"
+  | "transcribing"
+  | "injecting";
+
+type InjectionOutcome = "inserted" | "copiedToClipboard";
+
+type RecordingState = {
+  phase: RecordingPhase;
+  selectedDeviceId: string | null;
+  selectedDeviceName: string | null;
+  elapsedMs: number;
+  level: number;
+  lastRecordingPath: string | null;
+  lastTranscript: string | null;
+  lastInjectionOutcome: InjectionOutcome | null;
+  lastError: string | null;
+  hotkeyStyle: HotkeyStyle;
+  hotkey: string;
+  hotkeyRegistered: boolean;
+  hotkeyMessage: string | null;
 };
+
+type AsrSettings = {
+  model: string;
+  baseUrl: string;
+  apiKeyConfigured: boolean;
+  apiKeyHint: string | null;
+};
+
+type AudioLevelEvent = {
+  level: number;
+  elapsedMs: number;
+};
+
+const phaseLabels: Record<RecordingPhase, string> = {
+  idle: "待机",
+  starting: "正在启动",
+  recording: "录音中",
+  stopping: "正在停止",
+  cancelling: "正在取消",
+  transcribing: "正在识别",
+  injecting: "正在输入",
+};
+
+const phaseHints: Record<RecordingPhase, string> = {
+  idle: "选择麦克风后开始录音",
+  starting: "正在连接音频设备",
+  recording: "松开快捷键后自动识别",
+  stopping: "正在完成本次录音",
+  cancelling: "正在放弃本次录音",
+  transcribing: "正在请求 OpenAI 语音识别",
+  injecting: "正在粘贴识别结果",
+};
+
+const injectionLabels: Record<InjectionOutcome, string> = {
+  inserted: "已粘贴到当前应用",
+  copiedToClipboard: "已复制到剪贴板",
+};
+
+function formatError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatDuration(milliseconds: number) {
+  const safeMilliseconds = Math.max(0, milliseconds);
+  const minutes = Math.floor(safeMilliseconds / 60_000);
+  const seconds = Math.floor((safeMilliseconds % 60_000) / 1_000);
+  const tenths = Math.floor((safeMilliseconds % 1_000) / 100);
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(
+    2,
+    "0",
+  )}.${tenths}`;
+}
 
 function App() {
-  const [request, setRequest] = useState<RequestState>({ kind: "loading" });
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [recording, setRecording] = useState<RecordingState | null>(null);
+  const [asrSettings, setAsrSettings] = useState<AsrSettings | null>(null);
+  const [devices, setDevices] = useState<AudioDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [model, setModel] = useState("gpt-4o-transcribe");
+  const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
+  const [level, setLevel] = useState(0);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [commandError, setCommandError] = useState<string | null>(null);
 
-  const refreshStatus = useCallback(async () => {
-    setRequest({ kind: "loading" });
-
-    try {
-      const status = await invoke<RuntimeStatus>("get_runtime_status");
-      setRequest({ kind: "ready", status });
-    } catch (error) {
-      setRequest({
-        kind: "error",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
+  const applyRecordingState = useCallback((next: RecordingState) => {
+    setRecording(next);
+    setSelectedDeviceId(next.selectedDeviceId ?? "");
+    setLevel(next.level);
+    setElapsedMs(next.elapsedMs);
+    setCommandError(next.lastError);
   }, []);
 
-  useEffect(() => {
-    void refreshStatus();
-  }, [refreshStatus]);
+  const applyAsrSettings = useCallback((next: AsrSettings) => {
+    setAsrSettings(next);
+    setModel(next.model);
+    setBaseUrl(next.baseUrl);
+    setApiKey("");
+  }, []);
 
-  const status = request.kind === "ready" ? request.status : null;
-  const isWindows = status?.platform === "windows";
+  const loadDevices = useCallback(async () => {
+    const nextDevices = await invoke<AudioDeviceInfo[]>("list_audio_devices");
+    setDevices(nextDevices);
+    return nextDevices;
+  }, []);
+
+  const bootstrap = useCallback(async () => {
+    setPendingAction("bootstrap");
+    setCommandError(null);
+
+    try {
+      const [status, nextDevices, state, nextAsrSettings] = await Promise.all([
+        invoke<RuntimeStatus>("get_runtime_status"),
+        invoke<AudioDeviceInfo[]>("list_audio_devices"),
+        invoke<RecordingState>("get_recording_state"),
+        invoke<AsrSettings>("get_asr_settings"),
+      ]);
+
+      setRuntime(status);
+      setDevices(nextDevices);
+      applyRecordingState(state);
+      applyAsrSettings(nextAsrSettings);
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  }, [applyAsrSettings, applyRecordingState]);
+
+  useEffect(() => {
+    void bootstrap();
+  }, [bootstrap]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: UnlistenFn[] = [];
+
+    const attach = async () => {
+      const attached = await Promise.all([
+        listen<RecordingState>("recording-state", (event) => {
+          applyRecordingState(event.payload);
+        }),
+        listen<AudioLevelEvent>("audio-level", (event) => {
+          setLevel(event.payload.level);
+          setElapsedMs(event.payload.elapsedMs);
+        }),
+      ]);
+
+      if (disposed) {
+        attached.forEach((unlisten) => unlisten());
+      } else {
+        unlisteners.push(...attached);
+      }
+    };
+
+    void attach().catch((error) => setCommandError(formatError(error)));
+
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [applyRecordingState]);
+
+  const phase = recording?.phase ?? "idle";
+  const isIdle = phase === "idle";
+  const isActive = phase === "starting" || phase === "recording";
+  const isBusy = pendingAction !== null;
+  const selectedDevice = useMemo(
+    () => devices.find((device) => device.id === selectedDeviceId),
+    [devices, selectedDeviceId],
+  );
+
+  const runRecordingAction = async (
+    action: string,
+    command: () => Promise<RecordingState>,
+  ) => {
+    setPendingAction(action);
+    setCommandError(null);
+
+    try {
+      applyRecordingState(await command());
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleDeviceChange = async (deviceId: string) => {
+    setSelectedDeviceId(deviceId);
+    await runRecordingAction("device", () =>
+      invoke<RecordingState>("select_audio_device", {
+        deviceId: deviceId || null,
+      }),
+    );
+  };
+
+  const handleHotkeyStyle = async (style: HotkeyStyle) => {
+    await runRecordingAction("hotkey", () =>
+      invoke<RecordingState>("set_hotkey_style", { style }),
+    );
+  };
+
+  const handleStart = () =>
+    runRecordingAction("start", () =>
+      invoke<RecordingState>("start_recording", {
+        deviceId: selectedDeviceId || null,
+      }),
+    );
+
+  const handleStop = () =>
+    runRecordingAction("stop", () =>
+      invoke<RecordingState>("stop_recording"),
+    );
+
+  const handleCancel = () =>
+    runRecordingAction("cancel", () =>
+      invoke<RecordingState>("cancel_recording"),
+    );
+
+  const handleRefresh = async () => {
+    setPendingAction("devices");
+    setCommandError(null);
+
+    try {
+      const nextDevices = await loadDevices();
+      const stillAvailable =
+        !selectedDeviceId ||
+        nextDevices.some((device) => device.id === selectedDeviceId);
+
+      if (!stillAvailable) {
+        await handleDeviceChange("");
+      }
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleSaveAsrSettings = async () => {
+    setPendingAction("asr-save");
+    setCommandError(null);
+
+    try {
+      const next = await invoke<AsrSettings>("save_asr_settings", {
+        settings: {
+          apiKey: apiKey.trim() || null,
+          model,
+          baseUrl,
+        },
+      });
+      applyAsrSettings(next);
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleClearApiKey = async () => {
+    setPendingAction("asr-clear");
+    setCommandError(null);
+
+    try {
+      await invoke("clear_openai_api_key");
+      applyAsrSettings(await invoke<AsrSettings>("get_asr_settings"));
+      setApiKey("");
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -59,88 +312,338 @@ function App() {
           <span className="brand-name">Type4Me</span>
         </div>
 
-        <div className="sidebar-block">
-          <span className="sidebar-label">平台</span>
-          <strong>Windows</strong>
-        </div>
-
-        <div className="sidebar-block">
-          <span className="sidebar-label">当前阶段</span>
-          <strong>桌面基础</strong>
-        </div>
+        <nav className="sidebar-nav" aria-label="应用信息">
+          <div className="sidebar-block">
+            <span className="sidebar-label">平台</span>
+            <strong>Windows</strong>
+          </div>
+          <div className="sidebar-block">
+            <span className="sidebar-label">录音状态</span>
+            <strong>{phaseLabels[phase]}</strong>
+          </div>
+          <div className="sidebar-block">
+            <span className="sidebar-label">全局快捷键</span>
+            <strong>{recording?.hotkey ?? "Ctrl+Shift+Space"}</strong>
+            {recording?.hotkeyRegistered === false && <span>不可用</span>}
+          </div>
+        </nav>
 
         <div className="sidebar-note">
-          <span className="status-dot" data-online={status?.backendConnected} />
-          Rust 后端
+          <span
+            className="status-dot"
+            data-online={runtime?.backendConnected === true}
+          />
+          <span>Rust 音频后端</span>
+          <span className="sidebar-version">v{runtime?.version ?? "..."}</span>
         </div>
       </aside>
 
       <main className="workspace">
         <header className="page-header">
           <div>
-            <p className="eyebrow">Type4Me / Windows</p>
-            <h1>运行状态</h1>
+            <p className="eyebrow">Windows / Audio capture</p>
+            <h1>语音录音</h1>
           </div>
-          <button
-            className="refresh-button"
-            type="button"
-            onClick={() => void refreshStatus()}
-            disabled={request.kind === "loading"}
-          >
-            {request.kind === "loading" ? "检查中" : "重新检查"}
-          </button>
+          <span className="phase-badge" data-phase={phase}>
+            <span />
+            {phaseLabels[phase]}
+          </span>
         </header>
 
-        {request.kind === "error" && (
+        {commandError && (
           <div className="error-banner" role="alert">
-            <strong>无法连接 Rust 后端</strong>
-            <span>{request.message}</span>
+            <strong>操作未完成</strong>
+            <span>{commandError}</span>
           </div>
         )}
 
-        <section className="status-grid" aria-label="运行环境">
-          <article className="status-card">
-            <span className="card-label">操作系统</span>
-            <strong>
-              {status ? platformLabels[status.platform] ?? status.platform : "-"}
-            </strong>
-            <span className="card-detail">目标平台</span>
-          </article>
+        <section className="capture-band" aria-label="录音控制">
+          <div className="capture-readout">
+            <span className="section-label">REC</span>
+            <strong>{formatDuration(elapsedMs)}</strong>
+            <span className="capture-hint">{phaseHints[phase]}</span>
+          </div>
 
-          <article className="status-card">
-            <span className="card-label">处理器架构</span>
-            <strong>
-              {status
-                ? architectureLabels[status.architecture] ?? status.architecture
-                : "-"}
-            </strong>
-            <span className="card-detail">本机运行架构</span>
-          </article>
+          <div className="level-panel" aria-label="实时输入电平">
+            <div className="level-heading">
+              <span>输入电平</span>
+              <span>{Math.round(level * 100)}%</span>
+            </div>
+            <div className="level-track">
+              <span style={{ width: `${Math.round(level * 100)}%` }} />
+            </div>
+            <div className="level-scale" aria-hidden="true">
+              <span>-50 dB</span>
+              <span>0 dB</span>
+            </div>
+          </div>
 
-          <article className="status-card">
-            <span className="card-label">应用版本</span>
-            <strong>{status?.version ?? "-"}</strong>
-            <span className="card-detail">
-              {status ? (status.developmentBuild ? "开发构建" : "发布构建") : "读取中"}
-            </span>
-          </article>
-
-          <article className="status-card">
-            <span className="card-label">Tauri 通道</span>
-            <strong>{status?.backendConnected ? "已连接" : "未连接"}</strong>
-            <span className="card-detail">前端调用 Rust 命令</span>
-          </article>
+          <div className="capture-actions">
+            <button
+              className="record-button"
+              type="button"
+              onClick={() => void handleStart()}
+              disabled={!isIdle || isBusy}
+            >
+              <span className="record-icon" />
+              {pendingAction === "start" ? "启动中" : "开始录音"}
+            </button>
+            <button
+              className="stop-button"
+              type="button"
+              onClick={() => void handleStop()}
+              disabled={!isActive || isBusy}
+            >
+              <span className="stop-icon" />
+              {pendingAction === "stop" ? "停止中" : "停止并保存"}
+            </button>
+            <button
+              className="cancel-button"
+              type="button"
+              onClick={() => void handleCancel()}
+              disabled={!isActive || isBusy}
+              aria-label="取消当前录音"
+              title="取消当前录音"
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          </div>
         </section>
 
-        <section className="system-state">
-          <div>
-            <p className="eyebrow">基础检查</p>
-            <h2>{isWindows ? "Windows 环境已就绪" : "等待 Windows 环境"}</h2>
-          </div>
-          <div className="state-marker" data-ready={isWindows}>
-            <span />
-            {isWindows ? "可继续开发" : "平台不匹配"}
-          </div>
+        <section className="control-grid">
+          <article className="control-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">INPUT</span>
+                <h2>麦克风</h2>
+              </div>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void handleRefresh()}
+                disabled={!isIdle || isBusy}
+              >
+                {pendingAction === "devices" ? "扫描中" : "重新扫描"}
+              </button>
+            </div>
+
+            <label className="field-label" htmlFor="microphone">
+              录音设备
+            </label>
+            <select
+              id="microphone"
+              value={selectedDeviceId}
+              onChange={(event) => void handleDeviceChange(event.target.value)}
+              disabled={!isIdle || isBusy}
+            >
+              <option value="">系统默认麦克风</option>
+              {devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name}
+                  {device.isDefault ? "（默认）" : ""}
+                </option>
+              ))}
+            </select>
+
+            <div className="device-summary">
+              <span className="device-indicator" />
+              <div>
+                <strong>
+                  {selectedDevice?.name ??
+                    recording?.selectedDeviceName ??
+                    "尚未选择"}
+                </strong>
+                <span>
+                  {devices.length > 0
+                    ? `检测到 ${devices.length} 个输入设备`
+                    : "未检测到输入设备"}
+                </span>
+              </div>
+            </div>
+          </article>
+
+          <article className="control-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">HOTKEY</span>
+                <h2>全局快捷键</h2>
+              </div>
+              <div className="hotkey-meta">
+                <kbd>{recording?.hotkey ?? "Ctrl+Shift+Space"}</kbd>
+                <span
+                  className="hotkey-state"
+                  data-registered={recording?.hotkeyRegistered === true}
+                >
+                  {recording?.hotkeyRegistered ? "已启用" : "不可用"}
+                </span>
+              </div>
+            </div>
+
+            <span className="field-label">触发方式</span>
+            <div
+              className="segmented-control"
+              role="group"
+              aria-label="快捷键模式"
+            >
+              <button
+                type="button"
+                aria-pressed={recording?.hotkeyStyle === "hold"}
+                onClick={() => void handleHotkeyStyle("hold")}
+                disabled={!isIdle || isBusy}
+              >
+                按住说话
+              </button>
+              <button
+                type="button"
+                aria-pressed={recording?.hotkeyStyle !== "hold"}
+                onClick={() => void handleHotkeyStyle("toggle")}
+                disabled={!isIdle || isBusy}
+              >
+                按一次切换
+              </button>
+            </div>
+
+            <p
+              className="panel-note"
+              data-warning={recording?.hotkeyRegistered === false}
+            >
+              {recording?.hotkeyMessage ??
+                (recording?.hotkeyStyle === "hold"
+                  ? "按下快捷键开始录音，松开立即停止。"
+                  : "每次按下快捷键，在开始和停止之间切换。")}
+            </p>
+          </article>
+
+          <article className="control-panel settings-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">OPENAI</span>
+                <h2>语音识别</h2>
+              </div>
+              <span
+                className="settings-state"
+                data-configured={asrSettings?.apiKeyConfigured === true}
+              >
+                <span />
+                {asrSettings?.apiKeyConfigured ? "Key 已配置" : "需要 API Key"}
+              </span>
+            </div>
+
+            <div className="settings-form">
+              <label className="field">
+                <span className="field-label">识别模型</span>
+                <select
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  disabled={!isIdle || isBusy}
+                >
+                  <option value="gpt-4o-transcribe">
+                    gpt-4o-transcribe（推荐）
+                  </option>
+                  <option value="gpt-4o-mini-transcribe">
+                    gpt-4o-mini-transcribe
+                  </option>
+                  <option value="whisper-1">whisper-1</option>
+                </select>
+              </label>
+
+              <label className="field">
+                <span className="field-label">API 地址</span>
+                <input
+                  type="url"
+                  value={baseUrl}
+                  onChange={(event) => setBaseUrl(event.target.value)}
+                  spellCheck={false}
+                  disabled={!isIdle || isBusy}
+                />
+              </label>
+
+              <label className="field">
+                <span className="field-label">OpenAI API Key</span>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder={
+                    asrSettings?.apiKeyConfigured
+                      ? (asrSettings.apiKeyHint ?? "已保存")
+                      : "sk-..."
+                  }
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={!isIdle || isBusy}
+                />
+              </label>
+
+              <div className="settings-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => void handleSaveAsrSettings()}
+                  disabled={!isIdle || isBusy}
+                >
+                  {pendingAction === "asr-save" ? "保存中" : "保存设置"}
+                </button>
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => void handleClearApiKey()}
+                  disabled={
+                    !isIdle || isBusy || !asrSettings?.apiKeyConfigured
+                  }
+                >
+                  {pendingAction === "asr-clear" ? "清除中" : "清除 Key"}
+                </button>
+              </div>
+            </div>
+
+            <p className="panel-note">
+              API Key 仅保存在 Windows 凭据管理器。未配置时仍会保存 WAV
+              文件。
+            </p>
+          </article>
+
+          <article className="control-panel output-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">OUTPUT</span>
+                <h2>识别与输出</h2>
+              </div>
+              <span className="output-status">
+                {recording?.lastInjectionOutcome
+                  ? injectionLabels[recording.lastInjectionOutcome]
+                  : "等待识别"}
+              </span>
+            </div>
+
+            <div className="result-stack">
+              <section className="result-section">
+                <span className="field-label">识别结果</span>
+                {recording?.lastTranscript ? (
+                  <p className="transcript-text">
+                    {recording.lastTranscript}
+                  </p>
+                ) : (
+                  <p className="result-empty">尚未生成识别结果</p>
+                )}
+              </section>
+
+              <section className="result-section">
+                <span className="field-label">录音文件</span>
+                {recording?.lastRecordingPath ? (
+                  <div
+                    className="output-path"
+                    title={recording.lastRecordingPath}
+                  >
+                    <span className="output-icon" />
+                    <span>{recording.lastRecordingPath}</span>
+                  </div>
+                ) : (
+                  <p className="result-empty">尚未生成录音文件</p>
+                )}
+              </section>
+            </div>
+          </article>
         </section>
       </main>
     </div>

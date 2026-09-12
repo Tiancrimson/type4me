@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "windows:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 dev",
-    "windows:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 build"
+    "windows:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 build",
+    "windows:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tauri.ps1 test"
   },
   "dependencies": {
     "react": "^19.1.0",
