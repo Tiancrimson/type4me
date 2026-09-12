@@ -53,6 +53,25 @@ WAV files are stored in:
 
 The UI displays this directory and can open it in Windows Explorer.
 
+## Background operation and startup
+
+Type4Me runs in the Windows notification area so the global shortcut remains
+available after the main window is closed. Closing the window hides it; use
+**Quit / 退出** in the tray menu to stop the process completely. Left-clicking
+the tray icon restores the main window.
+
+The background panel can enable **Launch at startup / 开机自动启动**. Type4Me
+stores this as a current-user command in:
+
+```text
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+```
+
+The value is named `Type4Me` and launches the current executable with
+`--hidden`, so Windows sign-in starts the application directly in the tray.
+Disabling the switch removes only that value. Type4Me does not require
+administrator rights for this setting.
+
 ## Speech recognition configuration
 
 The Windows build supports local and OpenAI-compatible cloud providers:
