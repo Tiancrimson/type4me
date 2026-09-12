@@ -666,6 +666,96 @@ input:disabled {
   min-height: 390px;
 }
 
+.system-panel {
+  min-height: 250px;
+}
+
+.switch-control {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 54px;
+  cursor: pointer;
+}
+
+.switch-control input {
+  position: absolute;
+  width: 1px;
+  min-height: 0;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.switch-track {
+  position: relative;
+  flex: 0 0 auto;
+  width: 46px;
+  height: 26px;
+  border: 1px solid #b9c3c0;
+  border-radius: 999px;
+  background: #dfe5e3;
+}
+
+.switch-track > span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(23, 33, 38, 0.22);
+  transition:
+    left 150ms ease,
+    background-color 150ms ease;
+}
+
+.switch-control input:checked + .switch-track {
+  border-color: #3d956d;
+  background: #49a97d;
+}
+
+.switch-control input:checked + .switch-track > span {
+  left: 23px;
+}
+
+.switch-control input:focus-visible + .switch-track {
+  outline: 3px solid rgba(239, 106, 69, 0.24);
+  outline-offset: 2px;
+}
+
+.switch-control input:disabled + .switch-track {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.switch-control:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+.switch-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.switch-copy strong {
+  font-size: 14px;
+  font-weight: 680;
+}
+
+.switch-copy span {
+  color: #74807d;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .settings-state,
 .output-status {
   display: inline-flex;

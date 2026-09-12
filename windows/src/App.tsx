@@ -236,6 +236,7 @@ function App() {
   const [asrSettings, setAsrSettings] = useState<AsrSettings | null>(null);
   const [modelStatus, setModelStatus] =
     useState<SenseVoiceModelStatus | null>(null);
+  const [launchAtStartup, setLaunchAtStartup] = useState(false);
   const [devices, setDevices] = useState<AudioDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -281,12 +282,14 @@ function App() {
         state,
         nextAsrSettings,
         nextModelStatus,
+        launchAtStartupEnabled,
       ] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status"),
         invoke<AudioDeviceInfo[]>("list_audio_devices"),
         invoke<RecordingState>("get_recording_state"),
         invoke<AsrSettings>("get_asr_settings"),
         invoke<SenseVoiceModelStatus>("get_sensevoice_model_status"),
+        invoke<boolean>("get_launch_at_startup"),
       ]);
 
       setRuntime(status);
@@ -294,6 +297,7 @@ function App() {
       applyRecordingState(state);
       applyAsrSettings(nextAsrSettings);
       setModelStatus(nextModelStatus);
+      setLaunchAtStartup(launchAtStartupEnabled);
     } catch (error) {
       setCommandError(formatError(error));
     } finally {
@@ -553,6 +557,21 @@ function App() {
 
     try {
       await invoke("open_recordings_folder");
+    } catch (error) {
+      setCommandError(formatError(error));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const handleLaunchAtStartupChange = async (enabled: boolean) => {
+    setPendingAction("startup");
+    setCommandError(null);
+
+    try {
+      setLaunchAtStartup(
+        await invoke<boolean>("set_launch_at_startup", { enabled }),
+      );
     } catch (error) {
       setCommandError(formatError(error));
     } finally {
@@ -1061,6 +1080,49 @@ function App() {
                 </p>
               </section>
             </div>
+          </article>
+
+          <article className="control-panel system-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="section-label">SYSTEM</span>
+                <h2>后台运行 / Background</h2>
+              </div>
+              <span
+                className="settings-state"
+                data-configured={launchAtStartup}
+              >
+                <span />
+                {launchAtStartup
+                  ? "开机启动已开启 / Startup On"
+                  : "仅手动启动 / Manual Start"}
+              </span>
+            </div>
+
+            <label className="switch-control">
+              <input
+                type="checkbox"
+                role="switch"
+                checked={launchAtStartup}
+                onChange={(event) =>
+                  void handleLaunchAtStartupChange(event.target.checked)
+                }
+                disabled={isBusy}
+              />
+              <span className="switch-track" aria-hidden="true">
+                <span />
+              </span>
+              <span className="switch-copy">
+                <strong>登录 Windows 后自动启动</strong>
+                <span>Launch Type4Me after you sign in</span>
+              </span>
+            </label>
+
+            <p className="panel-note">
+              关闭主窗口后，Type4Me 会继续在系统托盘运行。需要完全退出时，请右键单击托盘图标并选择“退出”。
+              Closing the window keeps Type4Me running in the system
+              tray. Choose Quit from the tray menu to exit completely.
+            </p>
           </article>
         </section>
       </main>

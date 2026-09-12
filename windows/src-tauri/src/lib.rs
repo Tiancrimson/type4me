@@ -1,12 +1,17 @@
 use serde::Serialize;
 use std::{fs, path::PathBuf};
-use tauri::{AppHandle, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, Runtime, State, WindowEvent,
+};
 
 mod asr;
 mod audio;
 mod credentials;
 mod hotkey;
 mod injection;
+mod startup;
 mod wav;
 
 use asr::{
@@ -138,6 +143,17 @@ fn download_sensevoice_model(
     models.download()
 }
 
+#[tauri::command]
+fn get_launch_at_startup() -> Result<bool, String> {
+    startup::is_enabled()
+}
+
+#[tauri::command]
+fn set_launch_at_startup(enabled: bool) -> Result<bool, String> {
+    startup::set_enabled(enabled)?;
+    startup::is_enabled()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_panic_logger();
@@ -151,7 +167,23 @@ pub fn run() {
             let controller = AudioController::new(app.handle().clone(), model_manager);
             app.manage(controller.clone());
             controller.set_hotkey_registration(hotkey::register(app.handle()));
+            create_tray(app.handle())?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                if should_start_hidden() {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
@@ -170,9 +202,63 @@ pub fn run() {
             clear_asr_api_key,
             get_sensevoice_model_status,
             download_sensevoice_model,
+            get_launch_at_startup,
+            set_launch_at_startup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(
+        app,
+        "tray-show",
+        "显示主窗口 / Show Window",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "tray-quit", "退出 / Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .tooltip("Type4Me")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-show" => show_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
+fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn should_start_hidden() -> bool {
+    std::env::args_os().any(|argument| argument == "--hidden")
 }
 
 fn install_panic_logger() {
